@@ -1,27 +1,24 @@
 seed: 1106
-CUDA: '4,5'
+CUDA: '7,5'
 synced: False
 resume: False
 ckptPath: ''
-modelNameOrPath: '/data/gj/models--THUDM--chatglm-6b/snapshots/f83182484538e663a03d3f73647f10f89878f438'
-tokenizerNameOrPath: '/data/gj/models--THUDM--chatglm-6b/snapshots/f83182484538e663a03d3f73647f10f89878f438'
+doTrain: True
+modelNameOrPath: '/data/gj/vicuna-7b-v1.3'
+tokenizerNameOrPath: '/data/gj/vicuna-7b-v1.3'
+mlpPath: '/data/gj/PromptCompression-vicuna/savedModels/Step16/model_loss_2.0918.pth'
 trainFile: '/data/gj/data/samsum/train.json'
 valFile: '/data/gj/data/samsum/val.json'
-logSavedPath: '/data/gj/PromptCompression/logs'
-modelSavedPath: '/data/gj/PromptCompression/savedModels'
+testFile: '/data/gj/data/samsum/test.json'
+logSavedPath: '/data/gj/PromptCompression-vicuna/logs'
+modelSavedPath: '/data/gj/PromptCompression-vicuna/savedModels'
 
 hParams:
   epochs: 10
-  pointer: 0
   lr: 1e-4
   maxSourceLength: 256
   maxTargetLength: 64
   maxCprsedLength: 64
-  maskNums: 32
+  cprsedTokens: 32
   evalParams:
-    minLength: 11
-    maxLength: 62
-    evalStep: 7000
-    numBeams: 6
-    lengthPenalty: 1
-    earlyStopping: True
+    evalStep: 2000

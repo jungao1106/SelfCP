@@ -2,85 +2,53 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import re
 from torch.optim import Adam
-from transformers import AutoModel
-from torch.nn import KLDivLoss
+from transformers import LlamaForCausalLM
+from torch.nn import CrossEntropyLoss
 
 
 class ModelModule(nn.Module):
-    def __init__(self, modelNameOrPath) -> None:
+    def __init__(self, modelNameOrPath, mlpPath=None) -> None:
         super(ModelModule, self).__init__()
-        self.__model = AutoModel.from_pretrained(modelNameOrPath, trust_remote_code=True, revision='').half().transformer
-        self.__embedding = self.__model.get_input_embeddings()
-        self.__lossFn = KLDivLoss(reduction='batchmean', log_target=False)
-        self.__mlp = nn.Linear(4096, 4096)
-        
-    def forward(self, input_ids, c_input_ids, labels, c_labels):
-        input_embeds = self.__embedding(input_ids)
-        c_input_embeds = self.__embedding(c_input_ids)
-        
-        attention_mask = self.__model.get_masks(input_ids, input_ids.device)
-        c_attention_mask = self.__model.get_masks(c_input_ids, input_ids.device)
-        
-        MASK, gMASK = self.__model.config.mask_token_id, self.__model.config.gmask_token_id
-        seqs = input_ids.tolist()
+        self.__model = LlamaForCausalLM.from_pretrained(modelNameOrPath).half()
 
-        mask_positions, use_gmasks = [], []
-        for seq in seqs:
-            mask_token = gMASK if gMASK in seq else MASK
-            use_gmask = mask_token == gMASK
-            mask_positions.append(seq.index(mask_token))
-            use_gmasks.append(use_gmask)
-
-        position_ids = self.__model.get_position_ids(
-            input_ids,
-            mask_positions=mask_positions,
-            device=input_ids.device,
-            use_gmasks=use_gmasks
-        )
-        
-        c_seqs = c_input_ids.tolist()
-
-        c_mask_positions, c_use_gmasks = [], []
-        for seq in c_seqs:
-            c_mask_token = gMASK if gMASK in seq else MASK
-            c_use_gmask = c_mask_token == gMASK
-            c_mask_positions.append(seq.index(mask_token))
-            c_use_gmasks.append(c_use_gmask)
-
-        c_position_ids = self.__model.get_position_ids(
-            c_input_ids,
-            mask_positions=c_mask_positions,
-            device=c_input_ids.device,
-            use_gmasks=c_use_gmasks
-        )
+        if mlpPath:
+            self.__mlp = torch.load(mlpPath)
+        else:
+            self.__mlp = nn.Linear(4096, 4096)
+    
+    def inference(self, inputs, c_inputs):
         with torch.no_grad():
-            oriHiddenStates = self.__model(inputs_embeds = input_embeds,
-                                        attention_mask = attention_mask,
-                                        position_ids = position_ids)[0].permute(1, 0, 2)
+            oriHiddenStates = self.__model.model(**inputs)[0]
+            cprsed_shape = list(oriHiddenStates.shape)
+            cprsed_shape[1] = -1
+            cprsed_postion = (inputs['input_ids'] == self.__model.config.pad_token_id) & (inputs['attention_mask'] == 1)
+            cprsedHiddenStates = oriHiddenStates[cprsed_postion, ...].view(*cprsed_shape)
+            c_inputs['cprsed_embeds'] = self.__mlp(cprsedHiddenStates.float()).half()
+            outputs = self.__model.generate(**c_inputs,
+                                            max_length = 2048, num_beams=1,
+                                            do_sample=True, top_p=0.7, 
+                                            temperature=0.95, logits_processor=None)
+
+                
+            return outputs.tolist()[0][c_inputs['input_ids'].shape[-1]: ]
+            
+    
+    
+    def forward(self, inputs, c_inputs):
+        with torch.no_grad():
+            oriHiddenStates = self.__model.model(**inputs)[0]       
         
+        cprsed_shape = list(oriHiddenStates.shape)
+        cprsed_shape[1] = -1
+        cprsed_postion = (inputs['input_ids'] == self.__model.config.pad_token_id) & (inputs['attention_mask'] == 1)
+        cprsedHiddenStates = oriHiddenStates[cprsed_postion, ...].view(*cprsed_shape)
         
-        mask_shape = list(oriHiddenStates.shape)
-        mask_shape[1] = -1
-        maskHiddenStates = oriHiddenStates[input_ids == self.__model.config.mask_token_id, ...].view(*mask_shape)
+        cprsedHiddenStates = self.__mlp(cprsedHiddenStates.float()).half()
+        c_inputs['cprsed_embeds'] = cprsedHiddenStates
         
-        maskHiddenStates = self.__mlp(maskHiddenStates.float())
-        
-        labelHiddenStates = oriHiddenStates[labels != -100, ...].view(-1, oriHiddenStates.shape[-1])
-        target = F.softmax(labelHiddenStates, dim=-1)
-        
-        c_input_embeds[c_input_ids == self.__model.config.mask_token_id, ...] = maskHiddenStates.half().view(-1, c_input_embeds.shape[-1])
-        
-        #with torch.no_grad():
-        cprsedHiddenStates = self.__model(inputs_embeds = c_input_embeds,
-                                    attention_mask = c_attention_mask,
-                                    position_ids = c_position_ids)[0].permute(1, 0, 2)
-        outHiddenStates = cprsedHiddenStates[c_labels != -100, ...].view(-1, cprsedHiddenStates.shape[-1])
-        preds = F.log_softmax(outHiddenStates, dim=-1)
-        
-        loss = self.__lossFn(preds, target)
-        #compressedHiddenstate
-        
+        loss = self.__model(**c_inputs)['loss']
         return loss
 
     def FreezeBackbone(self):
@@ -90,7 +58,7 @@ class ModelModule(nn.Module):
             
     def SaveTrainedModel(self, val: float ,path: str = './') -> None:
         os.makedirs(path, exist_ok = True)
-        torch.save(self, os.path.join(path, 'model_f1_{0:.4f}.pth'.format(val)))
+        torch.save(self.__mlp, os.path.join(path, 'model_loss_{0:.4f}.pth'.format(val)))
     
     def ConfigOptimizer(self, lr: float) -> Adam:
         return Adam(self.parameters(), lr=lr)

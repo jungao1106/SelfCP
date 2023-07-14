@@ -4,7 +4,7 @@ import os
 import torch.distributed as dist
 import torch.cuda.amp as amp
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoTokenizer
 from tqdm import tqdm
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
@@ -18,18 +18,30 @@ class Trainer:
         self.__config = config
         if config['synced']:
             self.__localRank = int(os.environ['LOCAL_RANK'])
+            
+        #data loader
         self.__trainDataLoader = DataLoaders[0]
         self.__valDataLoader = DataLoaders[1]
+        self.__testDataLoader = DataLoaders[2]
+        
+        #(h)params
+        self.__modelSavedPath = config['modelSavedPath']
+        self.__evalParms = hParams['evalParams']
         self.__tokenizer = tokenizer
         self.__epochs = hParams['epochs']
         self.__lr = hParams['lr']
-        self.__evalParms = hParams['evalParams']
         self.__logger = SummaryWriter(config['logSavedPath'])
-        self.__modelSavedPath = config['modelSavedPath']
         self.__device = torch.device("cuda:{0}".format(self.__localRank)) if config['synced'] else 'cuda'
+        
+        #model
         self.__model = model
+        
         #AMP settings
         self.__scaler = amp.GradScaler()
+        
+        # log
+        self.__bestModel = 100
+        self.__evalSteps = 0
         
     def __Decoder(self, preds: torch.Tensor) -> list:
         preds = self.__tokenizer.batch_decode(preds, 
@@ -62,12 +74,14 @@ class Trainer:
         self.__model = self.__model.to(self.__device)
         #_lrScheduler = LinearLR(_optimizer, total_iters= self.__epochs)
         idx = 0
+        self.Evalueate()
         for epoch in range(self.__epochs):
             self.__model.train()
-            for batch in self.__trainDataLoader:
-                _batch = {k: v.to(self.__device, non_blocking=True) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            for batch in tqdm(self.__trainDataLoader, desc='train'):
+                batch['inputs'] = {k: v.to(self.__device) for k, v in batch['inputs'].items() if isinstance(v, torch.Tensor)}
+                batch['c_inputs'] = {k: v.to(self.__device) for k, v in batch['c_inputs'].items() if isinstance(v, torch.Tensor)}
                 with amp.autocast():
-                    loss = self.__model(**_batch)
+                    loss = self.__model(**batch)
                 if self.__config['synced'] and self.__localRank == 0:
                     self.__Log('train/loss', loss.item(), idx)
                 elif not self.__config['synced']:
@@ -97,35 +111,42 @@ class Trainer:
         #end for epoch
     
     def Evalueate(self):
-        
         self.__model.to(self.__device)
         self.__model.eval()
-        partialRouges = None
-        if self.__localRank == 0:
-            self.__model.module.SaveTrainedModel(-1,self.__modelSavedPath + 'latest' )
+
+        lossCollector = []
         with torch.no_grad():
             for batch in self.__valDataLoader:
-                summary = batch['summary']
-                _batch = {k: v.to(self.__device, non_blocking=True) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-                summarizedIDs = self.__model.module.Generate(_batch, self.__evalParms)
-                predict = self.__Decoder(summarizedIDs)
-
-                scores = self.__rougeScorer.get_scores(predict, summary)
-                scoresTensor = self.Dict2Tensor(scores)
-  
-                if partialRouges != None:
-                    partialRouges = torch.concat((partialRouges, scoresTensor), dim=0)
+                batch['inputs'] = {k: v.to(self.__device) for k, v in batch['inputs'].items() if isinstance(v, torch.Tensor)}
+                batch['c_inputs'] = {k: v.to(self.__device) for k, v in batch['c_inputs'].items() if isinstance(v, torch.Tensor)}
+                loss = self.__model(**batch)
+                lossCollector.append(loss)
+        
+        if not self.__config['synced'] or self.__config['synced'] and self.__localRank == 0:
+            avgLoss = sum(lossCollector)/len(lossCollector)
+            print('eval step {0}:average loss:{1}'.format(self.__evalSteps, avgLoss))
+            self.__Log('eval/loss', avgLoss, self.__evalSteps)
+            if avgLoss < self.__bestModel:
+                self.__bestModel = avgLoss
+                if self.__config['synced']:
+                    self.__model.module.SaveTrainedModel(avgLoss, self.__modelSavedPath + 'Step{0}'.format(self.__evalSteps))
                 else:
-                    partialRouges = scoresTensor
-                    
-            globalRouges = self.__DistributedGather(partialRouges.to(self.__device))
-            
-        if self.__localRank == 0:
-            avgRouge = self.__ComputeMetric(globalRouges)
-            print('eval step {0}:average rouge:{1}'.format(self.__evalSteps, avgRouge))
-            self.__Log('eval/F1', avgRouge, self.__evalSteps)
-            if avgRouge >= self.__bestModel:
-                self.__bestModel = avgRouge
-                self.__model.module.SaveTrainedModel(avgRouge, self.__modelSavedPath + 'Step{0}'.format(self.__evalSteps))
-            
-            self.__evalSteps += 1
+                    self.__model.SaveTrainedModel(avgLoss, self.__modelSavedPath + '/Step{0}'.format(self.__evalSteps))  
+        self.__evalSteps += 1
+             
+    def Test(self):
+        self.__model.to(self.__device)
+        self.__model.eval()
+        seqs = []
+        with torch.no_grad():
+            for batch in tqdm(self.__testDataLoader, desc='eval'):
+                batch['inputs'] = {k: v.to(self.__device) for k, v in batch['inputs'].items() if isinstance(v, torch.Tensor)}
+                batch['c_inputs'] = {k: v.to(self.__device) for k, v in batch['c_inputs'].items() if isinstance(v, torch.Tensor)}
+                preds = self.__model.inference(**batch)
+                seq = self.__tokenizer.decode(preds, skip_special_tokens=True)
+                seqs.append(seq)
+
+        fh = open('/data/gj/PromptCompression-vicuna/cprsed_result_414-691.txt', 'w', encoding = 'utf-8')
+        for seq in seqs:
+            fh.write(seq.replace('\n', '') + '\n')
+        fh.close()
