@@ -1,0 +1,76 @@
+seed: 1106
+CUDA: '7'
+synced: True
+resume: False
+ckptPath: ''
+
+#action:
+#1. train 
+#2. baseline
+#3. inference
+#4. qfs (query focused summarization)
+#5. context (in-context learning)
+action: 'baseline' 
+
+#task:
+#1. qa
+#2. sum
+#3. ins
+#4. qfs
+#5. context
+task: 'qfs'
+#compression:
+#1. recursive 
+#2. linear
+#3. fix
+#4. partial
+#5. cat
+compression: 'partial'
+
+modelNameOrPath: '/data1/gj/BlueLM'
+tokenizerNameOrPath: '/data1/gj/BlueLM'
+
+# modelNameOrPath: '/data1/gj/llama2-7b-chat-hf'
+# tokenizerNameOrPath: '/data1/gj/llama2-7b-chat-hf'
+
+embeddingPath: '/data1/gj/PromptCompression/savedModels-multi-blue/Step5/embedding_loss_2.0031.pth'
+mlpPath: '/data1/gj/PromptCompression/savedModels-multi-blue/Step5/model_loss_2.0031.pth'
+normPath: '/data1/gj/PromptCompression/savedModels-multi-blue/Step5/embedding_loss_2.0031.pth'
+
+shortTrainFile: '/data1/gj/PromptCompression/dataset/short_train_data.json'
+longTrainFile: '/data1/gj/PromptCompression/dataset/long_train_data.json'
+valFile: '/data1/gj/PromptCompression/dataset/val_data.json'
+
+#testFile: '/data1/gj/PromptCompression-vicuna/dataset/sbert_pubmedqa.json'
+#testFile: '/data1/gj/PromptCompression/dataset/cicero_test_long_query_data.json'
+#testFile: '/data1/gj/PromptCompression/dataset/duc_test_long_topic_data.json'
+#testFile: '/data1/gj/data/xsum/test.json'
+testFile: '/data1/gj/PromptCompression/dataset/duc_test_data.json'
+#testFile: '/data1/gj/PromptCompression-vicuna/dataset/ins_test_data.json'
+#testFile: '/data1/gj/data/declare-lab/cicero/test.json'
+#testFile: '/data1/gj/test_sbert_xsum_context.json'
+#testFile: '/data1/gj/test_sbert_cnn_dailymail.json'
+#testFile: '/data1/gj/test_sbert_arxiv.json'
+#testFile: '/data1/gj/test_sbert_nyt.json'
+#testFile: '/data1/gj/PromptCompression/dataset/llmcc_rerank_xsum.json'
+#testFile: '/data1/gj/PromptCompression-vicuna/retrieve-sat-cot.json'
+#testFile: '/data1/gj/PromptCompression/dataset/llmcc_rerank_arxiv.json'
+#testFile: '/data1/gj/data/legal/train.json'
+#testFile: '/data1/gj/PromptCompression/dataset/ratio-select-val.json'
+logSavedPath: '/data1/gj/PromptCompression/logs-multi-blue'
+modelSavedPath: '/data1/gj/PromptCompression/savedModels-multi-blue/'
+
+qaDescription: 'Combining the Dialogue, answer the following question'
+sumDescription: 'Summarize the following text'
+
+# maxContextLength: 1688
+maxContextLength: 1024
+maxTargetLength: 128
+maxPromptLength: 1024
+cprsedTokens: 8
+
+hParams:
+  epochs: 10
+  lr: 5e-5
+  evalParams:
+    evalStep: 4000

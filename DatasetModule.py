@@ -1,129 +1,413 @@
 import torch
+import math
 from torch.utils.data import Dataset
 from transformers import LlamaTokenizer
-
+from utils import PromptGather
+from numpy.random import uniform
 class DatasetModule(Dataset):
-    def __init__(self, data: list, query: str, system: str, tokenizer: LlamaTokenizer, 
-                 maxSourceLength: int = 512, maxTargetLength: int = 512, 
-                 maxCprsedLength: int = 512, cprsedTokens: int = 32, doTrain: bool = True) -> None:
+    def __init__(self, data: list, system: str, tokenizer: LlamaTokenizer, compression: str = None, task: str = None,
+                 maxContextLength: int = 512, maxTargetLength: int = 512, maxPromptLength: int = 512, 
+                 cprsedTokens: int = 32, action: str = 'train', promptGather: PromptGather = None, compressedPrompt = None) -> None:
         super(Dataset, self).__init__()
         self.__data = data
         self.__tokenizer = tokenizer
-        self.__maxSourceLength = maxSourceLength
-        self.__maxCprsedLength = maxCprsedLength
+        self.__maxContextLength = maxContextLength
+        self.__maxPromptLength = maxPromptLength
         self.__maxTargetLength = maxTargetLength
         self.__cprsedTokens = cprsedTokens
-        self.__query = query
         self.__system = system
-        self.__doTrain = doTrain
-        
+        self.__action = action
+        self.__promptGather = promptGather
+        self.__compression = compression
+        self.__task = task
+        self.__compressedPrompt = compressedPrompt
+        self.__ratio = 12
     def __len__(self) -> int:
         return len(self.__data)
     
     def __getitem__(self, index: int) -> dict:
         example = self.__data[index]
-        if self.__doTrain:
-            modelInputs = self.PreprocessForTrainWODescription(example, self.__query, True)
-            #model_inputs = self.PreprocessForTrain(example, self.__query, True)
-        else:
-            modelInputs = self.PreprocessForTest(example, self.__query)
+        # if 'cot' in self.__task:
+        #     example['similar0'] = self.__data[(index+1)%len(self.__data)]
+        #     example['similar1'] = self.__data[(index+2)%len(self.__data)]
+        if self.__action == 'train':
+            #modelInputs = self.PreprocessForTrain(example, True)
+            modelInputs = self.PreprocessForMultiTrain(example, True)
             
+        elif self.__action == 'baseline':
+            compressed_prompt = None
+            if len(self.__compressedPrompt) == 2:
+                compressed_prompt = self.__compressedPrompt[0]['compressed_prompt'] #+ self.__compressedPrompt[1]['compressed_prompt']
+            else:
+                compressed_prompt = example['compressed_prompt']
+            modelInputs = self.PreprocessForBaseline(example, self.__compression, self.__task,1, compressed_prompt)
+        
+        elif self.__action == 'context':
+            if 'cot' in self.__task:
+                modelInputs = self.PreprocessForCprsedCOT(example, self.__compression, self.__task, 2)
+            else:
+                modelInputs = self.PreprocessForInContextTest(example, self.__compression ,self.__task, 1)
+                
+        elif self.__action == 'qfs':
+                modelInputs = self.PreprocessForQFSTest(example, self.__compression, self.__task)  
+             
+        elif self.__action == 'inference':
+            if self.__compression == 'recursive':
+                modelInputs = self.PreprocessForRecursiveTest(example) 
+            elif self.__compression == 'partial':
+                modelInputs = self.PreprocessForPartialTest(example, self.__task)
+            else:
+                modelInputs = self.PreprocessForTest(example, self.__compression, self.__task)  
         return modelInputs
 
-    def PreprocessForTest(self, example, query):
-        if example['dialogue'] and example['summary']:
-            source = example['dialogue']
-
-        prompt = "{}: {}".format(query, source)
-        c_prompt = "{}:".format(query)
-        cprsed = '<unk>'*self.__cprsedTokens
+    def SetRatio(self, r):
+        self.__ratio = r
         
-        sourceIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
-        c_sourceIds = self.__tokenizer.encode(text=c_prompt, add_special_tokens=False)
-
-        # cprsed_ids = self.__tokenizer.encode(text=cprsed, add_special_tokens=False)
-        
-        if len(sourceIds) > self.__maxSourceLength:
-            prompt = self.__tokenizer.decode(sourceIds[: self.__maxSourceLength], skip_special_tokens=True)
-            sourceIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
-            
-        if len(c_sourceIds) > self.__maxCprsedLength:
-            c_prompt = self.__tokenizer.decode(c_sourceIds[: self.__maxCprsedLength], skip_special_tokens=True)
-            c_sourceIds = self.__tokenizer.encode(text=c_prompt, add_special_tokens=False)
-        inputIds = self.__tokenizer(f'{self.__system} USER: {prompt+cprsed} ASSISTANT:').input_ids
-        c_inputIds = self.__tokenizer(f'{self.__system} USER: {c_prompt+cprsed} ASSISTANT:').input_ids      
-
-        inputAttentionMask = [1]*len(inputIds)
-        c_inputAttentionMask = [1]*len(c_inputIds)      
-        
-        # pad_len = self.__maxSourceLength - len(source_ids)
-        # input_ids = input_ids + [self.__tokenizer.pad_token_id] * pad_len
-        # input_attention_mask = input_attention_mask + [0] * pad_len
-        
-        
-        # pad_len = self.__maxCprsedLength - len(c_source_ids)
-        # c_input_ids = c_input_ids + [self.__tokenizer.pad_token_id] * pad_len
-        # c_input_attention_mask = c_input_attention_mask + [0] * pad_len
+    def PreprocessForNaiveCOT(self, example, task, fewshot):
+        example['task'] = task
+        example['fewshot'] = fewshot
+        prompt, contexts = self.__promptGather.ConstructBaselinePrompts(example)
+        promptIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)[:self.__maxPromptLength]
+        contextIds = [self.__tokenizer.encode(text=context, add_special_tokens=False) for context in contexts]
+        if fewshot > 0:
+            contextIds = contextIds[0] if fewshot == 1 else contextIds[0] + contextIds[1]
+            inputIds = contextIds[ :self.__maxContextLength - len(promptIds)] + promptIds
+        else:
+            inputIds = promptIds[ :self.__maxContextLength]
         
         return {
+            'inputs': {
+                'input_ids': torch.tensor(inputIds).flatten()
+            }
+        }        
+    
+    def PreprocessForCprsedCOT(self, example, compression, task, fewshot):
+        example['fewshot'] = fewshot
+        example['task'] = task
+        prompt, contexts, _ = self.__promptGather.ConstructCprsedPrompts(example)
+        prompt = prompt.strip()
+        
+        fewContextIds = [self.__tokenizer.encode(text=context, add_special_tokens=False) for context in contexts]
+        fewContextIds = [contextIds[ :self.__maxContextLength] for contextIds in fewContextIds]
+        
+        promptIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
+        promptIds = promptIds[ :self.__maxPromptLength]
+
+        cprsed_nums = self.__cprsedTokens
+        cprsed_nums = math.ceil(sum([len(item) for item in fewContextIds])/len(fewContextIds)/12)
+        cprsed = [4] * cprsed_nums
+        inputIdsHead = self.__tokenizer(f'{self.__system}').input_ids
+
+        fewInputIds = []
+        for i in range(fewshot):
+            fewInputIds.append(inputIdsHead + [3] +  fewContextIds[i] + cprsed)
+            
+        c_inputIdsHead = self.__tokenizer(f'{self.__system} USER:').input_ids
+        c_inputIdsTail = self.__tokenizer(f'ASSISTANT: The Answer is', add_special_tokens=False).input_ids
+    
+        if compression == 'cat':
+            c_inputIds = c_inputIdsHead + cprsed*len(fewInputIds) + promptIds + c_inputIdsTail
+        else:
+            c_inputIds = c_inputIdsHead + cprsed + promptIds + c_inputIdsTail
+        return {
+            'op': compression,
+            'inputs':{
+                'input_ids': [torch.tensor(inputIds).flatten() for inputIds in fewInputIds],
+            },
+            'c_inputs':{
+                'input_ids': torch.tensor(c_inputIds).flatten()
+            }
+        }
+        
+    def PreprocessForBaseline(self, example, compression, task, fewshot=0, compressed_prompt = None):
+            example['task'] = task
+            example['fewshot'] = fewshot
+            prompt, context = self.__promptGather.ConstructBaselinePrompts(example)
+            prompt = prompt.strip()
+                
+            promptIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)[ :self.__maxPromptLength]
+            if task == 'qfs':
+                contextIds = self.__tokenizer.encode(text=context, add_special_tokens=False)
+            else:
+                contextIds = self.__tokenizer.encode(text=context, add_special_tokens=False)
+                
+            
+            if 'context' in task:
+                inputIdsHead = self.__tokenizer(f'{self.__system}').input_ids
+                if 'cot' in task:
+                    inputIdsTail = self.__tokenizer(f'ASSISTANT: The Answer is', add_special_tokens=False).input_ids
+                else:    
+                    inputIdsTail = self.__tokenizer(f'ASSISTANT:', add_special_tokens=False).input_ids
+            else:
+                inputIdsHead = self.__tokenizer(f'{self.__system} USER:').input_ids
+                inputIdsTail = self.__tokenizer(f'ASSISTANT:', add_special_tokens=False).input_ids
+            
+            # #contextIds = contextIds[: math.ceil(len(contextIds)/2)]    
+            # promptLen = len(inputIdsHead) + len(inputIdsTail) + len(promptIds)
+            # tail = contextIds[self.__maxContextLength-promptLen: ]
+            contextIds = contextIds[: self.__maxContextLength]
+            contextIds = contextIds[math.ceil(len(contextIds)/2): ]  
+            
+            # contextIds = contextIds[:self.__maxContextLength]
+            # tail = contextIds[math.ceil(len(contextIds)/2): ]
+            # contextIds = contextIds[ :math.ceil(len(contextIds)/2)]
+            if 'context' in task:
+                #zero
+                #inputIds = inputIdsHead + self.__tokenizer(f'USER:', add_special_tokens=False).input_ids + promptIds + inputIdsTail
+                #one
+                inputIds = inputIdsHead + contextIds+ self.__tokenizer(f'USER:', add_special_tokens=False).input_ids + promptIds + inputIdsTail
+            else:
+                if compressed_prompt is None:
+                    inputIds = inputIdsHead + promptIds + contextIds + inputIdsTail
+                    #inputIds = promptIds + contextIds
+                else:
+                    compressed_promptIds = self.__tokenizer.encode(compressed_prompt, add_special_tokens=False)
+                    inputIds = inputIdsHead + promptIds + compressed_promptIds + contextIds + inputIdsTail
+            
+            if compression == 'recursive':
+                return {
+                    'inputs': {
+                        'input_ids': torch.tensor(inputIds).flatten(),
+                        'head': inputIdsHead,
+                        'prompt': promptIds,
+                        'tail': inputIdsTail,
+                        'tailContext': tail
+                    }}
+            else:
+                return {
+                    'inputs': {
+                        'input_ids': torch.tensor(inputIds).flatten(),
+                    }}   
+    
+    def PreprocessForPartialTest(self, example, task):
+        '''Assuming the max input length is 512'''
+        #example['task'] = task
+        prompt, context, _ = self.__promptGather.ConstructCprsedPrompts(example)
+        prompt = prompt.strip()
+
+        contextIds = self.__tokenizer.encode(text=context, add_special_tokens=False)[:self.__maxContextLength]
+        promptIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
+        contextIds = contextIds[ :self.__maxContextLength]
+        
+        p = math.ceil(0.5*len(contextIds))
+
+                
+        inputIdsHead = c_inputIdsHead = self.__tokenizer(f'{self.__system} USER:').input_ids
+        inputIdsTail = c_inputIdsTail = self.__tokenizer(f'ASSISTANT:', add_special_tokens=False).input_ids
+        
+
+        promptLen = len(inputIdsHead) + len(promptIds) + 1 + len(inputIdsTail)
+        cprsed_nums = math.ceil(p // self.__ratio)
+        promptLen += cprsed_nums
+        
+        cprsed = [4] * cprsed_nums
+        
+        c_inputIds = c_inputIdsHead + promptIds + cprsed + contextIds[:p] + inputIdsTail
+                
+        inputIds = inputIdsHead + promptIds + [3] + contextIds[p:] + cprsed
+  
+        return {
+            'op': 'partial',
             'inputs':{
                 'input_ids': torch.tensor(inputIds).flatten(),
-                'attention_mask': torch.tensor(inputAttentionMask).flatten()
             },
             'c_inputs':{
                 'input_ids': torch.tensor(c_inputIds).flatten(),
-                'attention_mask': torch.tensor(c_inputAttentionMask).flatten(),
+            }}
+          
+    def PreprocessForTest(self, example, compression, task):
+        example['task'] = task
+        prompt, context, _ = self.__promptGather.ConstructCprsedPrompts(example)
+        prompt = prompt.strip()
+        
+        promptIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
+        contextIds = self.__tokenizer.encode(text=context, add_special_tokens=False)
+        
+        contextIds = contextIds[ :self.__maxContextLength]
+
+        if compression == 'linear':
+            cprsed_nums = math.ceil(len(contextIds)/12)#math.ceil(self.__cprsedTokens * (len(contextIds) / self.__maxContextLength))
+        elif compression == 'fix':
+            cprsed_nums = self.__cprsedTokens
+        
+        cprsed = [4]* cprsed_nums
+        inputIdsHead = c_inputIdsHead = self.__tokenizer(f'{self.__system} USER:').input_ids
+        inputIdsTail = c_inputIdsTail = self.__tokenizer(f'ASSISTANT:', add_special_tokens=False).input_ids
+        
+        inputIds = inputIdsHead + promptIds + [3] + contextIds + cprsed + inputIdsTail
+
+        c_inputIds = c_inputIdsHead + promptIds + cprsed + c_inputIdsTail
+    
+        return {
+            
+            'op': 'inference',
+            'inputs':{
+                'input_ids': torch.tensor(inputIds).flatten(),
+            },
+            'c_inputs':{
+                'input_ids': torch.tensor(c_inputIds).flatten(),
             }
         }
 
-
-    def PreprocessForTrain(self, example, query, ignorePadToken):
-        if example['dialogue'] and example['summary']:
-            source, target = example['dialogue'], example['summary']
-
-        prompt = "{}: {}".format(query, source)
-        c_prompt = "{}:".format(query)
-        cprsed = '<unk>'*self.__cprsedTokens
+    def PreprocessForMultiTrain(self, example, ignorePadToken):
+        prompt, context, target = self.__promptGather.ConstructCprsedPrompts(example)
+        prompt = prompt.strip()
         
-        sourceIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
-        targetIds = self.__tokenizer.encode(text=target, add_special_tokens=False)
-        c_sourceIds = self.__tokenizer.encode(text=c_prompt, add_special_tokens=False)
+        promptIds = self.__tokenizer.encode(text=prompt)
+        contextIds = self.__tokenizer.encode(text=context, add_special_tokens=False)
+        targetIds = self.__tokenizer.encode(text=target+self.__tokenizer.eos_token, add_special_tokens=False)
+        systemIds = self.__tokenizer(f'{self.__system} USER:').input_ids
         
-        if len(sourceIds) > self.__maxSourceLength:
-            prompt = self.__tokenizer.decode(sourceIds[: self.__maxSourceLength], skip_special_tokens=True)
-            sourceIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
+        
+        sepIds = self.__tokenizer(f'ASSISTANT:', add_special_tokens=False).input_ids
+        
+        promptIds = promptIds[ :self.__maxPromptLength]    
+        contextIds = contextIds[ :self.__maxContextLength]
+        targetIds = targetIds[ :self.__maxTargetLength]
+
+        drop = uniform()
+        partialLength = 0
+        if 0 <= drop < 0.5:
+            op = 'partial'
+            if len(contextIds) < 768:
+                partialLength = math.ceil(0.5*len(contextIds))
+                cprsed_nums = math.ceil(0.5*len(contextIds)) // 12
+                cprsed = [4] * cprsed_nums
+                if drop < 0.25: # compress latter
+                    inputIds = systemIds + promptIds + [3] + contextIds[math.ceil(0.5*len(contextIds)): ] + cprsed
+                    c_inputIds = systemIds + promptIds + contextIds[ :math.ceil(0.5*len(contextIds))] + cprsed + sepIds + targetIds
+                else: # compress former
+                    inputIds = systemIds + promptIds + [3] + contextIds[ :math.ceil(0.5*len(contextIds))] + cprsed
+                    c_inputIds = systemIds + promptIds + cprsed + contextIds[math.ceil(0.5*len(contextIds)): ] + sepIds + targetIds
+                    
+            else:
+                '''long partial compression'''
+                if drop < 0.25: # compress latter
+                    partialLength = 512
+                    cprsed_nums = len(contextIds[512: ]) // 12
+                    cprsed = [4] * cprsed_nums
+                    inputIds = systemIds + promptIds + [3] + contextIds[512: ] + cprsed
+                    c_inputIds = systemIds + promptIds + contextIds[ :512] + cprsed + sepIds + targetIds
+                else: # compress former
+                    partialLength = len(contextIds[512: ])
+                    cprsed_nums = len(contextIds[ :512]) // 12
+                    cprsed = [4] * cprsed_nums
+                    inputIds = systemIds + promptIds + [3] + contextIds[ :512] + cprsed
+                    c_inputIds = systemIds + promptIds + cprsed + contextIds[512: ] + sepIds + targetIds
+
+        elif 0.5 <= drop < 0.7:
+            op = 'recursive'
+            inputIds = []
+            step_length = min(512, len(contextIds)//2) + 1
+            cprsed_nums = step_length // 12
+            holder = [5] * cprsed_nums
+            cprsed = [4] * cprsed_nums
+            for i in range(0, len(contextIds), step_length):
+                inputIds.append(systemIds + promptIds + holder * min(i, 1) + [3] + contextIds[i: i + step_length] + cprsed)
+            c_inputIds = systemIds + promptIds + cprsed + sepIds +targetIds
             
+        elif 0.7 <= drop < 0.8:
+            op = 'concat'
+            inputIds = []
+            step_length = min(512, len(contextIds)//2)
+            cprsed_nums = step_length // 12
+            holder = [5] * cprsed_nums
+            cprsed = [4] * cprsed_nums
+            for i in range(0, len(contextIds), step_length):
+                inputIds.append(systemIds + promptIds + holder * len(inputIds) + [3] + contextIds[i: i+step_length] + cprsed)
+            c_inputIds = systemIds + promptIds + cprsed * len(inputIds) + sepIds + targetIds
+            
+        elif 0.8 <= drop <1:
+            op = 'linear'
+            cprsed_nums = len(contextIds)//12
+            cprsed = [4] * cprsed_nums
+            inputIds =  systemIds + promptIds + [3] + contextIds + cprsed 
+            c_inputIds =  systemIds + promptIds + cprsed + sepIds + targetIds
+        
+        if op == 'concat':
+            c_contextLength = len(systemIds + promptIds + cprsed*len(inputIds) + sepIds)
+        else:
+            c_contextLength = len(systemIds + promptIds + cprsed + sepIds) + partialLength
+            
+        c_labels = [-100] * c_contextLength + c_inputIds[c_contextLength:]
+        
+        if op == 'recursive' or op == 'concat':
+            return {
+                'op': op,
+                'inputs':{
+                    'input_ids': [torch.tensor(item).flatten() for item in inputIds],
+                },
+                'c_inputs':{
+                    'input_ids': torch.tensor(c_inputIds).flatten(),
+                    'labels': torch.tensor(c_labels).flatten()
+                }
+            }
+        else:
+            return {
+                'op': op,
+                'inputs': {
+                    'input_ids': torch.tensor(inputIds).flatten(),
+                },
+                'c_inputs': {
+                    'input_ids': torch.tensor(c_inputIds).flatten(),
+                    'labels': torch.tensor(c_labels).flatten()
+                }
+            }
+        
+    def PreprocessForTrain(self, example, ignorePadToken):
+        prompt, context, target = self.__promptGather.ConstructCprsedPrompts(example)
+        prompt = prompt.strip()
+        
+        promptIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
+        contextIds = self.__tokenizer.encode(text=context, add_special_tokens=False)
+        targetIds = self.__tokenizer.encode(text=target+self.__tokenizer.eos_token, add_special_tokens=False)
+        
+        if len(contextIds) > self.__maxContextLength:
+            contextIds = contextIds[ :self.__maxContextLength]
+        
         if len(targetIds) > self.__maxTargetLength:
-            target = self.__tokenizer.decode(targetIds[: self.__maxTargetLength], skip_special_tokens=True)
-            targetIds = self.__tokenizer.encode(text=target, add_special_tokens=False)
+            targetIds = targetIds[ :self.__maxTargetLength]
             
-        if len(c_sourceIds) > self.__maxCprsedLength:
-            c_prompt = self.__tokenizer.decode(c_sourceIds[: self.__maxCprsedLength], skip_special_tokens=True)
-            c_sourceIds = self.__tokenizer.encode(text=c_prompt, add_special_tokens=False)
-            
-        inputIds = self.__tokenizer(f'{self.__system} USER: {prompt+cprsed} ASSISTANT: </s>').input_ids
-        c_inputIds = self.__tokenizer(f'{self.__system} USER: {c_prompt+cprsed} ASSISTANT: {target}</s>').input_ids
-         
+        if len(promptIds) > self.__maxPromptLength:
+            promptIds = promptIds[ :self.__maxPromptLength]
+
+        padLen = self.__maxContextLength + self.__maxPromptLength + self.__cprsedTokens - len(contextIds) - len(promptIds)
+        c_padLen = self.__maxPromptLength + self.__maxTargetLength + self.__cprsedTokens - len(promptIds) - len(targetIds) + math.ceil(0.1*self.__maxContextLength)
+
+        # padLen = c_padLen = 0
+        
+        drop = uniform()
+        if drop < 0.3:
+            c_padLen = c_padLen - math.ceil(0.1*len(contextIds))
+            promptIds = promptIds + contextIds[: math.ceil(0.1*len(contextIds))]
+            contextIds = contextIds[math.ceil(0.1*len(contextIds)): ]
+    
+        cprsed_nums = math.ceil(self.__cprsedTokens * (len(contextIds) / self.__maxContextLength))
+        cprsed = [4] * cprsed_nums
+        padLen = padLen - cprsed_nums
+        c_padLen = c_padLen - cprsed_nums
+                
+        inputIdsHead = c_inputIdsHead = self.__tokenizer(f'{self.__system} Human:').input_ids
+        inputIdsTail = c_inputIdsTail = self.__tokenizer(f'ASSISTANT:', add_special_tokens=False).input_ids
+
+        inputIds = inputIdsHead + promptIds + [3] + contextIds + cprsed + inputIdsTail
+        c_inputIds = c_inputIdsHead + promptIds + cprsed + c_inputIdsTail + targetIds
+        
         inputAttentionMask = [1]*len(inputIds)
         c_inputAttentionMask = [1]*len(c_inputIds)      
         
-        padLen = self.__maxSourceLength - len(sourceIds)
         inputIds = inputIds + [self.__tokenizer.pad_token_id] * padLen
         inputAttentionMask = inputAttentionMask + [0] * padLen
         
-        # 5 is the number ids of 'ASSISTANT:'
-        # 1 is the space token after <unk>
-        c_context_length = c_inputIds.index(self.__tokenizer.pad_token_id) + self.__maskNums + 5 + 1
-        c_labels = [-100] * c_context_length + c_inputIds[c_context_length:]
+        c_contextLength = len(c_inputIdsHead + cprsed + c_inputIdsTail)
+        c_labels = [-100] * c_contextLength + c_inputIds[c_contextLength:]
         
-        padLen = self.__maxCprsedLength + self.__maxTargetLength - len(c_sourceIds) - len(targetIds)
-        c_inputIds = c_inputIds + [self.__tokenizer.pad_token_id] * padLen
-        c_labels = c_labels + [self.__tokenizer.pad_token_id] * padLen
-        c_inputAttentionMask = c_inputAttentionMask + [0] * padLen
+        c_inputIds = c_inputIds + [self.__tokenizer.pad_token_id] * c_padLen
+        c_labels = c_labels + [self.__tokenizer.pad_token_id] * c_padLen
+        c_inputAttentionMask = c_inputAttentionMask + [0] * c_padLen
         
         if ignorePadToken:
             c_labels = [(l if l != self.__tokenizer.pad_token_id or c_inputAttentionMask[i] else -100) for i, l in enumerate(c_labels)]
-
 
         return {
             'inputs':{
@@ -136,64 +420,239 @@ class DatasetModule(Dataset):
                 'labels': torch.tensor(c_labels).flatten()
             }
         }
+    
+    def PreprocessForRecursiveTest(self, example, task):
+        example['task'] = task
+        prompt, context, _ = self.__promptGather.ConstructCprsedPrompts(example)
+        prompt = prompt.strip()
         
-        
-    def PreprocessForTrainWODescription(self, example, query, ignorePadToken):
-        if example['dialogue'] and example['summary']:
-            source, target = example['dialogue'], example['summary']
+        contextIds = self.__tokenizer.encode(text=context, add_special_tokens=False)
+        p_contextIds = contextIds[ :156]
+        contextIds = contextIds[156: ]
+        contextRecIds = [contextIds[i: i+self.__maxContextLength] for i in range(0, len(contextIds), self.__maxContextLength)]
 
-        prompt = source
-        c_prompt = "{}:".format(query)
-        cprsed = '<unk>'*self.__cprsedTokens
+        cprsed_nums = self.__cprsedTokens
+        cprsed = [4] * cprsed_nums
+        holder = [5] * cprsed_nums
+        inputIdsHead = c_inputIdsHead = self.__tokenizer(f'{self.__system} USER: {prompt}').input_ids
+        inputIdsTail = c_inputIdsTail = self.__tokenizer(f'ASSISTANT:', add_special_tokens=False).input_ids
         
-        sourceIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
-        targetIds = self.__tokenizer.encode(text=target, add_special_tokens=False)
-        c_sourceIds = self.__tokenizer.encode(text=c_prompt, add_special_tokens=False)
+        inputIds = [inputIdsHead + p_contextIds + [3] + holder * min(i, 1) + contextIds + cprsed + inputIdsTail for i, contextIds in enumerate(contextRecIds)]
+        inputIds = inputIds[:1]
+        inputIds[-1] = inputIds[-1] + (len(inputIds[0]) - len(inputIds[-1]))*[0]
+        c_inputIds = c_inputIdsHead + p_contextIds + cprsed + c_inputIdsTail
         
-        if len(sourceIds) > self.__maxSourceLength:
-            prompt = self.__tokenizer.decode(sourceIds[: self.__maxSourceLength], skip_special_tokens=True)
-            sourceIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
-            
-        if len(targetIds) > self.__maxTargetLength:
-            target = self.__tokenizer.decode(targetIds[: self.__maxTargetLength], skip_special_tokens=True)
-            targetIds = self.__tokenizer.encode(text=target, add_special_tokens=False)
-            
-        if len(c_sourceIds) > self.__maxCprsedLength:
-            c_prompt = self.__tokenizer.decode(c_sourceIds[: self.__maxCprsedLength], skip_special_tokens=True)
-            c_sourceIds = self.__tokenizer.encode(text=c_prompt, add_special_tokens=False)
-            
-        inputIds = self.__tokenizer(f'{prompt+cprsed}').input_ids
-        c_inputIds = self.__tokenizer(f'{self.__system} USER: {c_prompt+cprsed} ASSISTANT: {target}</s>').input_ids
-         
-        inputAttentionMask = [1]*len(inputIds)
-        c_inputAttentionMask = [1]*len(c_inputIds)      
-        
-        padLen = self.__maxSourceLength - len(sourceIds)
-        inputIds = inputIds + [self.__tokenizer.pad_token_id] * padLen
-        inputAttentionMask = inputAttentionMask + [0] * padLen
-        
-        # 5 is the number ids of 'ASSISTANT:'
-        # 1 is the space token after <unk>
-        c_context_length = c_inputIds.index(self.__tokenizer.pad_token_id) + self.__maskNums + 5 + 1
-        c_labels = [-100] * c_context_length + c_inputIds[c_context_length:]
-        
-        padLen = self.__maxCprsedLength + self.__maxTargetLength - len(c_sourceIds) - len(targetIds)
-        c_inputIds = c_inputIds + [self.__tokenizer.pad_token_id] * padLen
-        c_labels = c_labels + [self.__tokenizer.pad_token_id] * padLen
-        c_inputAttentionMask = c_inputAttentionMask + [0] * padLen
-        
-        if ignorePadToken:
-            c_labels = [(l if l != self.__tokenizer.pad_token_id or c_inputAttentionMask[i] else -100) for i, l in enumerate(c_labels)]
-
-
         return {
             'inputs':{
-                'input_ids': torch.tensor(inputIds).flatten(),
-                'attention_mask': torch.tensor(inputAttentionMask).flatten()
+                'input_ids': [torch.tensor(item) for item in inputIds],
             },
             'c_inputs':{
-                'input_ids': torch.tensor(c_inputIds).flatten(),
-                'attention_mask': torch.tensor(c_inputAttentionMask).flatten(),
-                'labels': torch.tensor(c_labels).flatten()
+                'input_ids': torch.tensor(c_inputIds).flatten()
             }
         }
+
+    def PreprocessForInContextTest(self, example, compression, task, fewshot):
+        '''prompt contains the inference example'''
+        '''max context(prompt) length should be 768'''
+        example['fewshot'] = fewshot
+        example['task'] = task
+        prompt, contexts, _ = self.__promptGather.ConstructCprsedPrompts(example)
+        prompt = prompt.strip()
+        
+        fewContextIds = [self.__tokenizer.encode(text=context, add_special_tokens=False) for context in contexts]
+        fewContextIds = [contextIds[ :self.__maxContextLength] for contextIds in fewContextIds]
+        
+        promptIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
+        promptIds = promptIds[ :self.__maxPromptLength]
+
+        cprsed_nums = self.__cprsedTokens
+        cprsed_nums = math.ceil(sum([len(item) for item in fewContextIds])/len(fewContextIds)/12)
+        cprsed = [4] * cprsed_nums
+        holder = [5] * cprsed_nums
+        inputIdsHead = self.__tokenizer(f'{self.__system}').input_ids
+
+        fewInputIds = []
+        fewInputIds.append(inputIdsHead + [3] +  fewContextIds[0] + cprsed)
+        if compression == 'recursive':
+            for i in range(1, fewshot):
+                fewInputIds.append(inputIdsHead + holder + [3] + fewContextIds[i] + cprsed)
+        elif compression == 'cat' or compression == 'add':
+            for i in range(1, fewshot):
+                fewInputIds.append(inputIdsHead + [3] + fewContextIds[i] + cprsed)
+            
+        c_inputIdsHead = self.__tokenizer(f'{self.__system} USER:').input_ids
+        c_inputIdsTail = self.__tokenizer(f'ASSISTANT:', add_special_tokens=False).input_ids
+    
+        if compression == 'cat':
+            c_inputIds = c_inputIdsHead + cprsed*len(fewInputIds) + promptIds + c_inputIdsTail
+        else:
+            c_inputIds = c_inputIdsHead + cprsed + promptIds + c_inputIdsTail
+        return {
+            'op': compression,
+            'inputs':{
+                'input_ids': [torch.tensor(inputIds).flatten() for inputIds in fewInputIds],
+            },
+            'c_inputs':{
+                'input_ids': torch.tensor(c_inputIds).flatten()
+            }
+        }
+
+    def PreprocessForQFSTest(self, example, compression, task):
+        '''Assuming the max input length is 512'''
+        example['task'] = task
+        prompt, contexts, _ = self.__promptGather.ConstructCprsedPrompts(example)
+        prompt = prompt.strip()
+
+        contextIds = [self.__tokenizer.encode(text=context, add_special_tokens=False) for context in contexts]
+        promptIds = self.__tokenizer.encode(text=prompt, add_special_tokens=False)
+        contextIds = contextIds[0] + contextIds[1] #+ contextIds[2] #+ contextIds[3] + contextIds[4] + contextIds[5] + contextIds[6] + contextIds[7] + contextIds[8] + contextIds[9]
+        
+        inputIdsHead = c_inputIdsHead = self.__tokenizer(f'{self.__system} USER:').input_ids
+        inputIdsTail = c_inputIdsTail = self.__tokenizer(f'ASSISTANT:', add_special_tokens=False).input_ids
+        
+        
+        #cprsed_nums = self.__cprsedTokens   
+         
+
+        ratio = 12
+        promptLen = len(inputIdsHead) + len(promptIds) + 1 + len(inputIdsTail)
+        cprsed_nums = math.ceil((self.__maxContextLength - promptLen)/((ratio+1)/ratio)/ratio)
+        promptLen += cprsed_nums
+        
+        cprsed = [4] * cprsed_nums
+        holder = [5] * cprsed_nums
+    
+           
+        if compression == 'linear':
+            #compre wo prompt
+            end = self.__maxContextLength - promptLen
+            c_inputIds = c_inputIdsHead + promptIds + cprsed + c_inputIdsTail
+        
+                   
+            inputIds = inputIdsHead +[3] + contextIds[ :end] + cprsed + inputIdsTail
+           
+        elif compression == 'partial':
+            #compre wo prompt
+            # start = 0
+            # end = start + self.__maxContextLength - promptLen
+            # c_inputIds = c_inputIdsHead + promptIds + cprsed + contextIds[: end+1] + c_inputIdsTail
+            
+            # start = end
+            # end = start + self.__maxContextLength - promptLen
+                   
+            # inputIds = inputIdsHead + [3] + contextIds[start: end] + cprsed + inputIdsTail
+            
+            #front uncompressed
+            # start = 0
+            # end = start + self.__maxContextLength - promptLen
+            # c_inputIds = c_inputIdsHead + promptIds + cprsed + contextIds[: end+1] + c_inputIdsTail
+            
+            # start = end
+            # end = start + self.__maxContextLength - promptLen
+                   
+            # inputIds = inputIdsHead + promptIds + [3] + contextIds[start: end] + cprsed + inputIdsTail
+            
+            # behind uncompressed
+            start = 0
+            end = start + self.__maxContextLength - promptLen
+            inputIds = inputIdsHead + promptIds + [3] + contextIds[start: end] + cprsed + inputIdsTail
+            
+            start = end
+            end = start + self.__maxContextLength - promptLen
+
+            c_inputIds = c_inputIdsHead + promptIds + cprsed + contextIds[start: end+1] + c_inputIdsTail
+        
+        elif compression == 'recursive':
+            start = 0
+            end = start + self.__maxContextLength - promptLen
+            c_inputIds = c_inputIdsHead + promptIds + cprsed + contextIds[: end+1] + c_inputIdsTail
+               
+            
+            start = end
+            end = start + self.__maxContextLength - promptLen
+                   
+            inputIds = [inputIdsHead + promptIds + [3] + contextIds[start: end] + cprsed + inputIdsTail]
+      
+            
+            while end < len(contextIds):      
+                start = end
+                end = start + self.__maxContextLength - promptLen - cprsed_nums
+                    
+                inputIds.append(inputIdsHead + promptIds + holder +[3] + contextIds[start: end] + cprsed + inputIdsTail)
+        
+        elif compression == 'cat':
+            start = 0
+            end = start + self.__maxContextLength - promptLen - cprsed_nums
+            c_inputIds = c_inputIdsHead + promptIds + cprsed*2 + contextIds[0][: end+1] + c_inputIdsTail
+               
+            
+            start = end
+            end = start + self.__maxContextLength - promptLen
+                   
+            inputIds = [inputIdsHead + promptIds + [3] + contextIds[0][start: end] + cprsed + inputIdsTail]
+    
+            # start = end
+            # end = start + self.__maxContextLength - promptLen - cprsed_nums
+            start = 0
+            end = start + self.__maxContextLength - promptLen
+                
+            inputIds.append(inputIdsHead + promptIds + [3] + contextIds[1][start: end] + cprsed + inputIdsTail)
+        
+        elif compression == 'add':
+            start = 0
+            end = start + self.__maxContextLength - promptLen
+            c_inputIds = c_inputIdsHead + promptIds + cprsed + contextIds[0][: end+1] + c_inputIdsTail
+               
+            
+            start = end
+            end = start + self.__maxContextLength - promptLen
+                   
+            inputIds = [inputIdsHead + promptIds + [3] + contextIds[0][start: end] + cprsed + inputIdsTail]
+    
+            # start = end
+            # end = start + self.__maxContextLength - promptLen - cprsed_nums
+            start = 0
+            end = start + self.__maxContextLength - promptLen
+                
+            inputIds.append(inputIdsHead + promptIds +[3] + contextIds[1][start: end] + cprsed + inputIdsTail)
+        
+        if compression == 'recuresive' and len(inputIds[-1]) != 512:
+            inputIds.pop() #trunctate the latst not filled elements
+            
+        if compression == 'cat' or compression == 'add' or compression == 'recursive':
+            return {
+                'op': compression,
+                'inputs':{
+                    'input_ids': [torch.tensor(item).flatten() for item in inputIds],
+                },
+                'c_inputs':{
+                    'input_ids': torch.tensor(c_inputIds).flatten(),
+                }
+            }
+        else:
+            return{
+                'op': compression,
+                'inputs':{
+                    'input_ids': torch.tensor(inputIds).flatten(),
+                },
+                'c_inputs':{
+                    'input_ids': torch.tensor(c_inputIds).flatten(),
+                }
+            }
+
+
+# if __name__ == '__main__':
+#     import json
+#     from fastchat.model.model_adapter import get_conversation_template
+#     from utils import PromptGather
+#     from transformers import LlamaTokenizer
+#     #/data1/gj/PromptCompression-vicuna/dataset/duc_test_data.json
+#     data = json.load(open('/data1/gj/test_sbert_xsum_context.json'))
+#     t = LlamaTokenizer.from_pretrained('/data1/gj/vicuna-7b-v1.3')
+#     p = promptGather = PromptGather(['Summarize the following text', 'Combining the Dialogue, answer the following question'])
+#     x = DatasetModule(data, get_conversation_template('vicuna').system, t,'cat', 'train' ,1024, 128, 1024, 32, 'baseline', p)
+
+#     for i in range(0, len(data)):
+#         y = x[i]  
+#         #print(y['inputs']['input_ids'].shape, y['inputs']['attention_mask'].shape)
+#         #print(y['c_inputs']['input_ids'].shape, y['c_inputs']['attention_mask'].shape)
